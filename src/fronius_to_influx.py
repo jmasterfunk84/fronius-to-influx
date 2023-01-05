@@ -3,9 +3,11 @@ import datetime
 import json
 from time import sleep
 from typing import Any, Dict, List, Type
+import traceback
 
 import pytz
-from astral import Location
+from astral.location import LocationInfo
+from astral.sun import sun
 from influxdb import InfluxDBClient
 from requests import get
 from requests.exceptions import ConnectionError
@@ -25,12 +27,13 @@ class DataCollectionError(Exception):
 
 class FroniusToInflux:
     BACKOFF_INTERVAL = 3
-    IGNORE_SUN_DOWN = False
+    IGNORE_SUN_DOWN = True
 
-    def __init__(self, client: InfluxDBClient, location: Location, endpoints: List[str], tz: Any) -> None:
+    def __init__(self, client: InfluxDBClient, location: LocationInfo, endpoints: List[str], archiveendpoints: List[str], tz: Any) -> None:
         self.client = client
         self.location = location
         self.endpoints = endpoints
+        self.archiveendpoints = archiveendpoints
         self.tz = tz
         self.data: Dict[Any, Any] = {}
 
@@ -111,6 +114,25 @@ class FroniusToInflux:
         else:
             raise DataCollectionError("Unknown data collection type.")
 
+    def translate_archiveresponse(self) -> List[Dict]:
+        channels = self.data['Head']['RequestArguments']['Channel']
+        startdate = datetime.datetime.fromisoformat(self.data['Head']['RequestArguments']['StartDate'])
+        measurements = {}
+        for channel in channels:
+            channeldata = self.data['Body']['Data']['inverter/1']['Data'][channel]['Values']
+            for timeoffset in channeldata:
+                offsetstamp = (startdate + datetime.timedelta(seconds=int(timeoffset))).strftime("%Y-%m-%dT%H:%M:%S%z")
+                if offsetstamp not in measurements:
+                    measurements.update({offsetstamp:{}})
+                measurements[offsetstamp].update({channel:float(channeldata[timeoffset])})
+        output = []
+        for timestamp in measurements:
+            output.append({
+                'measurement': 'ArchiveData',
+                'time': timestamp,
+                'fields': measurements[timestamp]
+                })
+        return output
 
     def sun_is_shining(self) -> None:
         sun = self.location.sun()
@@ -122,12 +144,18 @@ class FroniusToInflux:
         try:
             while True:
                 try:
-                    self.sun_is_shining()
+                    #self.sun_is_shining()
                     collected_data = []
                     for url in self.endpoints:
                         response = get(url)
                         self.data = response.json()
                         collected_data.extend(self.translate_response())
+                        sleep(self.BACKOFF_INTERVAL)
+                    for url in self.archiveendpoints:
+                        datedurl = url + "&StartDate=" + (datetime.datetime.now() - datetime.timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S") + "-06:00&EndDate=" + datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "-06:00"
+                        response = get(datedurl)
+                        self.data = response.json()
+                        collected_data.extend(self.translate_archiveresponse())
                         sleep(self.BACKOFF_INTERVAL)
                     self.client.write_points(collected_data)
                     print('Data written')
@@ -143,6 +171,7 @@ class FroniusToInflux:
                 except Exception as e:
                     self.data = {}
                     sleep(10)
+                    print(traceback.format_exc())
                     print("Exception: {}".format(e))
 
         except KeyboardInterrupt:
